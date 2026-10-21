@@ -1,0 +1,11 @@
+[project]
+name = "numerai-visualiser"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numerapi>=3.1.1",
+    "numpy>=2.5.4",
+    "pandas>=3.0.6",
+    "polars>=2.0.0",
+    "pyarrow>=26.0.0",
+]

@@ -1,114 +1,391 @@
-// Unity Cube: the whole Numerai v6.0 dataset as a GPU-resident uint8 volume, viewed as three slices.
+// Numerai Cube: the whole Numerai v6.0 dataset as a GPU-resident uint8 volume, viewed as three slices.
 //   X = ticker, +Y = feature, -Y = target, Z = date. Every cell is one byte on a shared colour ramp.
+//   Data comes from the viewer's own parquet files (decoded in workers, nothing is uploaded) or from
+//   the copy cached in this browser's origin-private file system after the first load.
+import { parquetMetadataAsync } from "./vendor/hyparquet/index.js";
 
 const $ = (id) => document.getElementById(id);
-const DATA = "../data/cube/";
 const TEX_W = 8192;                      // texture row width (the guaranteed WebGPU 2D limit)
-const STAGE = 64 << 20;                  // upload staging size
+const STAGE = 64 << 20;                  // upload slice size when reading the cache
+const MAX_TASKS = 256, MAX_TASK_ROWS = 1 << 20;   // index packs task << 20 | row
+const CACHE_DIR = "numerai-cube", CACHE_VERSION = 1;
 const BOX = { WX: 4, WF: 1.2, WT: 0.18, WZ: 2 };  // world extents: tickers, features, targets, dates
 const BIN_BYTES = [0, 64, 127, 191, 254];
-const RAMP = ["#7fb0ee", "#3a73bd", "#4a4a47", "#bd4744", "#f0948d"];  // low -> high, grey midpoint
-const NULL_FG = "#898781", NULL_BG = "#2a2a28", EMPTY = "#222220", LOADING = "#141413";
+const KIND = { bin: 0, target: 1, cont: 2 };
+const PALETTES = {  // low -> high
+  blueRed: ["#7fb0ee", "#3a73bd", "#4a4a47", "#bd4744", "#f0948d"],
+  redGreen: ["#f7746d", "#b3423d", "#4a4a47", "#2a8a52", "#3fc27b"],
+  viridis: ["#472d7b", "#3b528b", "#21918c", "#5ec962", "#fde725"],  // monotone lightness, colour-blind safe
+};
+let palette = "blueRed";
+try { if (PALETTES[localStorage.getItem("palette")]) palette = localStorage.getItem("palette"); } catch {}
+const NULL_FG = "#898781", NULL_BG = "#2a2a28", EMPTY = "#222220";
 const BG = [0x0d / 255, 0x0d / 255, 0x0d / 255];
 
 const setStatus = (s) => { $("status").textContent = s; };
 const setProgress = (f) => { $("bar").firstElementChild.style.width = `${(f * 100).toFixed(1)}%`; };
+const fmt = (n) => n.toLocaleString();
+const gib = (b) => `${(b / 2 ** 30).toFixed(2)} GiB`;
 function fail(html) {
+  $("start").style.display = "none";
   $("err").style.display = "block";
   $("err").innerHTML = html;
   setStatus("error");
   throw new Error(html);
 }
 
-// ---------- WebGPU device ----------
-if (!navigator.gpu) fail("WebGPU is not available in this browser. On Linux Chrome try <code>--enable-unsafe-webgpu --enable-features=Vulkan</code>.");
+// ---------- WebGPU adapter ----------
+if (!navigator.gpu) fail("WebGPU is not available in this browser. Use a recent Chrome or Edge; on Linux, start Chrome with <code>--enable-unsafe-webgpu --enable-features=Vulkan</code>.");
 const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
 if (!adapter) fail("No WebGPU adapter found.");
-
-const meta = await (await fetch(DATA + "meta.json")).json();
-// ?dates=N loads only the first N dates (for testing on small or software GPUs)
-const dateParam = +new URLSearchParams(location.search).get("dates");
-const T = meta.tickers.length, D = dateParam > 0 ? Math.min(dateParam, meta.dates.length) : meta.dates.length, NF = meta.features.length, NT = meta.targets.length;
-const NC = NF + NT, L = Math.ceil(T / TEX_W), offs = meta.row_offsets;
-const columns = meta.columns.map((c) => c.name);
-
-// Pack whole dates into storage buffers no larger than the device allows to bind.
-const bindLimit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize, 2 ** 31);
-const chunkLimit = Math.floor(bindLimit / 4) * 4;
-const dateChunk = new Uint8Array(D), dateRow0 = new Uint32Array(D), dateEnd = new Float64Array(D);
-const chunks = [];
-for (let d = 0, cur = null; d < D; d++) {
-  const rows = offs[d + 1] - offs[d], bytes = rows * NC;
-  if (!cur || cur.bytes + bytes > chunkLimit) chunks.push(cur = { bytes: 0, rows: 0 });
-  dateChunk[d] = chunks.length - 1;
-  dateRow0[d] = cur.rows;
-  cur.rows += rows;
-  cur.bytes += bytes;
-  dateEnd[d] = cur.bytes;
-}
-const K = chunks.length;
-if (K > adapter.limits.maxStorageBuffersPerShaderStage) {
-  fail(`Needs ${K} storage buffers of ≤${(chunkLimit / 2 ** 30).toFixed(2)} GiB but the GPU allows ${adapter.limits.maxStorageBuffersPerShaderStage}.`);
-}
-const device = await adapter.requestDevice({
-  requiredLimits: {
-    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-    maxBufferSize: adapter.limits.maxBufferSize,
-    maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
-  },
-});
-device.lost.then((info) => fail(`GPU device lost: ${info.message}`));
-device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
 const gpuName = adapter.info?.description || adapter.info?.architecture || "GPU";
+// Values are split into storage buffers ("chunks") no larger than the device can bind.
+const bindLimit = Math.floor(Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize, 2 ** 31) / 4) * 4;
+const maxChunks = adapter.limits.maxStorageBuffersPerShaderStage;
 
-// ---------- row index: (ticker, date) -> chunk<<24 | row within chunk, -1 = no row ----------
-setStatus("building index…");
-const rowTicker = new Uint16Array(await (await fetch(DATA + "row_ticker.u16")).arrayBuffer());
-const index = new Int32Array(TEX_W * D * L).fill(-1);
-for (let d = 0; d < D; d++) {
-  const c = dateChunk[d], r0 = dateRow0[d], base = offs[d];
-  for (let r = base; r < offs[d + 1]; r++) {
-    const t = rowTicker[r];
-    index[(((t / TEX_W) | 0) * D + d) * TEX_W + (t % TEX_W)] = (c << 24) | (r0 + r - base);
+let device = null;
+async function createDevice(chunkBytes) {
+  if (chunkBytes.length > maxChunks) {
+    throw new Error(`Needs ${chunkBytes.length} GPU buffers of ≤${gib(bindLimit)}, but this GPU allows ${maxChunks}. Try fewer files.`);
   }
+  device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+      maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
+    },
+  });
+  device.lost.then((info) => fail(`GPU device lost: ${info.message}. Reload to try again.`));
+  device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
+  device.pushErrorScope("out-of-memory");
+  const bufs = chunkBytes.map((size) => device.createBuffer({
+    size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  }));
+  const oom = await device.popErrorScope();
+  if (oom) throw new Error(`Not enough GPU memory for ${gib(chunkBytes.reduce((a, b) => a + b, 0))} of cells (${oom.message}). Try fewer files, e.g. validation only.`);
+  return bufs;
 }
+
+// Greedily pack task byte sizes into chunks.
+function packChunks(sizes) {
+  const chunk = [], base = [], bytes = [];
+  for (const s of sizes) {
+    if (!bytes.length || bytes.at(-1) + s > bindLimit) bytes.push(0);
+    chunk.push(bytes.length - 1);
+    base.push(bytes.at(-1));
+    bytes[bytes.length - 1] += s;
+  }
+  return { chunk, base, bytes };
+}
+
+// ---------- browser cache (origin-private file system) ----------
+async function cacheDir(create) {
+  try { return await (await navigator.storage.getDirectory()).getDirectoryHandle(CACHE_DIR, { create }); }
+  catch { return null; }
+}
+async function clearCache() {
+  try { await (await navigator.storage.getDirectory()).removeEntry(CACHE_DIR, { recursive: true }); } catch { /* none */ }
+}
+async function readCacheMeta() {
+  const dir = await cacheDir(false);
+  if (!dir) return null;
+  try {
+    const meta = JSON.parse(await (await (await dir.getFileHandle("meta.json")).getFile()).text());
+    return meta.version === CACHE_VERSION ? meta : null;
+  } catch { return null; }
+}
+// meta.json is written last, so an interrupted save is never mistaken for a cache.
+async function openCacheWriter(chunkBytes) {
+  if (!navigator.storage?.getDirectory) return null;
+  await clearCache();
+  const need = chunkBytes.reduce((a, b) => a + b, 0) + (256 << 20);
+  const { quota = 0, usage = 0 } = await navigator.storage.estimate();
+  if (quota - usage < need) return null;
+  navigator.storage.persist?.();
+  const dir = await cacheDir(true);
+  const writers = await Promise.all(chunkBytes.map(async (_, k) => (await dir.getFileHandle(`chunk_${k}.bin`, { create: true })).createWritable()));
+  const writeFile = async (name, data) => {
+    const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+    await w.write(data);
+    await w.close();
+  };
+  return {
+    write: (k, position, data) => writers[k].write({ type: "write", position, data }),
+    async finish(meta, index) {
+      await Promise.all(writers.map((w) => w.close()));
+      await writeFile("index.bin", index);
+      await writeFile("meta.json", JSON.stringify(meta));
+    },
+    async abort() {
+      await Promise.all(writers.map((w) => w.abort().catch(() => {})));
+      await clearCache();
+    },
+  };
+}
+
+// ---------- source 1: the user's parquet files ----------
+const fileBuffer = (file) => ({ byteLength: file.size, slice: (s, e) => file.slice(s, e).arrayBuffer() });
+
+// Run tasks on a pool of module workers; onResult is awaited before that worker gets more work.
+function runPool(count, job, onResult) {
+  const n = Math.min(count, Math.max(1, Math.min(8, Math.floor((navigator.hardwareConcurrency || 4) * 0.75))));
+  const workers = Array.from({ length: n }, () => new Worker(new URL("./ingest-worker.js", import.meta.url), { type: "module" }));
+  let next = 0;
+  return Promise.all(workers.map((w) => new Promise((resolve, reject) => {
+    const feed = () => {
+      if (next >= count) { w.terminate(); resolve(); return; }
+      w.postMessage(job(next++));
+    };
+    w.onmessage = async (e) => {
+      if (e.data.error) { reject(new Error(e.data.error)); return; }
+      try { await onResult(e.data); feed(); } catch (err) { reject(err); }
+    };
+    w.onerror = (e) => reject(new Error(e.message || "worker failed"));
+    feed();
+  }))).finally(() => workers.forEach((w) => w.terminate()));
+}
+
+async function ingestParquet(files) {
+  files = [...files].sort((a, b) => a.name.localeCompare(b.name));
+  setStatus("reading file footers…");
+  const infos = [];
+  for (const file of files) infos.push({ file, md: await parquetMetadataAsync(fileBuffer(file)) });
+
+  // Columns come from the first file: features (minus the text country) then targets (minus the `target` alias).
+  const leaves = infos[0].md.schema.slice(1);
+  for (const { file, md } of infos) {
+    const names = new Set(md.schema.map((e) => e.name));
+    if (!names.has("numerai_ticker") || !names.has("date")) {
+      throw new Error(`${file.name} isn't a Numerai v6 file (it has no numerai_ticker/date columns).`);
+    }
+  }
+  const features = leaves.filter((e) => e.name.startsWith("feature_") && e.name !== "feature_country").map((e) => e.name);
+  const targets = leaves.filter((e) => e.name.startsWith("target_")).map((e) => e.name);
+  for (const { file, md } of infos.slice(1)) {
+    const names = new Set(md.schema.map((e) => e.name));
+    const missing = [...features, ...targets].find((c) => !names.has(c));
+    if (missing) throw new Error(`${file.name} has different columns from ${infos[0].file.name} (no ${missing}).`);
+  }
+  const typeOf = new Map(leaves.map((e) => [e.name, e.type]));
+  const columns = [...features, ...targets].map((name) =>
+    name.startsWith("target_") ? { name, kind: "target" }
+      : typeOf.get(name) === "INT32" ? { name, kind: "bin" }
+      : { name, kind: "cont", min: Infinity, max: -Infinity });
+
+  // Continuous min/max over every row group, straight from the footer statistics.
+  const cont = new Map(columns.filter((c) => c.kind === "cont").map((c) => [c.name, c]));
+  for (const { md } of infos) for (const rg of md.row_groups) for (const cc of rg.columns) {
+    const col = cont.get(cc.meta_data?.path_in_schema?.[0]);
+    const st = cc.meta_data?.statistics;
+    if (!col || !st) continue;
+    if (Number.isFinite(Number(st.min_value))) col.min = Math.min(col.min, Number(st.min_value));
+    if (Number.isFinite(Number(st.max_value))) col.max = Math.max(col.max, Number(st.max_value));
+  }
+  for (const c of cont.values()) {
+    if (!(c.max > c.min)) { console.warn(`no statistics for ${c.name}; assuming -4..4`); c.min = -4; c.max = 4; }
+  }
+
+  // One task per row group, split if a row group would not fit in one GPU buffer.
+  const NC = columns.length;
+  const maxRows = Math.min(MAX_TASK_ROWS, Math.floor(bindLimit / NC));
+  const tasks = [];
+  for (const { file, md } of infos) {
+    let start = 0;
+    for (const rg of md.row_groups) {
+      const n = Number(rg.num_rows);
+      for (let s = 0; s < n; s += maxRows) tasks.push({ file, rowStart: start + s, rows: Math.min(maxRows, n - s) });
+      start += n;
+    }
+  }
+  if (tasks.length > MAX_TASKS) throw new Error(`Too many row groups (${tasks.length}); at most ${MAX_TASKS} are supported.`);
+  const totalRows = tasks.reduce((a, t) => a + t.rows, 0);
+  const plan = packChunks(tasks.map((t) => Math.ceil((t.rows * NC) / 4) * 4));
+  const chunkBufs = await createDevice(plan.bytes);
+  const cache = $("useCache").checked ? await openCacheWriter(plan.bytes) : null;
+
+  const t0 = performance.now();
+  const kinds = Uint8Array.from(columns, (c) => KIND[c.kind]);
+  const lo = Float64Array.from(columns, (c) => c.min ?? 0), hi = Float64Array.from(columns, (c) => c.max ?? 1);
+  const names = columns.map((c) => c.name);
+  const results = new Array(tasks.length);
+  let doneRows = 0;
+  try {
+    await runPool(tasks.length,
+      (i) => ({ i, file: tasks[i].file, rowStart: tasks[i].rowStart, rowEnd: tasks[i].rowStart + tasks[i].rows, columns: names, kinds, lo, hi }),
+      async (res) => {
+        const i = res.i, bytes = new Uint8Array(res.bytes);
+        device.queue.writeBuffer(chunkBufs[plan.chunk[i]], plan.base[i], bytes);
+        if (cache) await cache.write(plan.chunk[i], plan.base[i], bytes);
+        await device.queue.onSubmittedWorkDone();  // keep queued uploads bounded
+        delete res.bytes;
+        results[i] = res;
+        doneRows += tasks[i].rows;
+        setProgress(doneRows / totalRows);
+        const rate = doneRows / ((performance.now() - t0) / 1000);
+        setStatus(`decoding ${fmt(doneRows)} / ${fmt(totalRows)} rows · ${fmt(Math.round(rate))} rows/s`);
+      });
+  } catch (e) {
+    await cache?.abort();
+    throw e;
+  }
+
+  // Global tickers and dates, then the (ticker, date) -> task/row index.
+  setStatus("building index…");
+  const dateTypeOf = new Map();
+  for (const r of results) r.dateNames.forEach((d, k) => { if (!dateTypeOf.has(d)) dateTypeOf.set(d, r.dateTypes[k]); });
+  const dates = [...dateTypeOf.keys()].sort();
+  const dateIdx = new Map(dates.map((d, i) => [d, i]));
+  const tickerId = new Map(), tickers = [], country = [], countryAt = [], firstSeen = [];
+  for (const r of results) {
+    r.gTick = new Uint32Array(r.tickNames.length);
+    r.tickNames.forEach((name, k) => {
+      let id = tickerId.get(name);
+      if (id === undefined) {
+        id = tickers.length;
+        tickerId.set(name, id);
+        tickers.push(name); country.push(""); countryAt.push(""); firstSeen.push("~");
+      }
+      r.gTick[k] = id;
+      const first = r.dateNames[r.tickFirst[k]], last = r.dateNames[r.tickLast[k]];
+      if (first < firstSeen[id]) firstSeen[id] = first;
+      if (last >= countryAt[id]) { countryAt[id] = last; country[id] = r.tickCountry[k]; }
+    });
+  }
+  const D = dates.length, L = Math.ceil(tickers.length / TEX_W);
+  const index = new Int32Array(TEX_W * D * L).fill(-1);
+  results.forEach((r, i) => {
+    const gDate = Uint32Array.from(r.dateNames, (d) => dateIdx.get(d));
+    for (let row = 0; row < r.tickCodes.length; row++) {
+      const t = r.gTick[r.tickCodes[row]], d = gDate[r.dateCodes[row]];
+      index[(((t / TEX_W) | 0) * D + d) * TEX_W + (t % TEX_W)] = (i << 20) | row;
+    }
+  });
+
+  const meta = {
+    version: CACHE_VERSION, created: new Date().toISOString(), source: files.map((f) => f.name).join(", "), rows: totalRows,
+    tickers, country, first_seen: firstSeen, dates, date_type: dates.map((d) => dateTypeOf.get(d)),
+    features, targets, columns, tasks: tasks.map((t, i) => [plan.chunk[i], plan.base[i], t.rows]), chunkBytes: plan.bytes,
+  };
+  if (cache) {
+    setStatus("saving to browser cache…");
+    try { await cache.finish(meta, index); } catch (e) { console.warn("cache save failed", e); await clearCache(); }
+  }
+  return { meta, index, chunkBufs, seconds: (performance.now() - t0) / 1000 };
+}
+
+// ---------- source 2: the browser cache ----------
+async function loadCache(meta) {
+  if (meta.chunkBytes.some((b) => b > bindLimit) || meta.chunkBytes.length > maxChunks) {
+    throw new Error("The cached cube was built for a different GPU. Choose the parquet files again.");
+  }
+  const t0 = performance.now();
+  const chunkBufs = await createDevice(meta.chunkBytes);
+  const dir = await cacheDir(false);
+  const total = meta.chunkBytes.reduce((a, b) => a + b, 0);
+  let done = 0;
+  for (let k = 0; k < meta.chunkBytes.length; k++) {
+    const file = await (await dir.getFileHandle(`chunk_${k}.bin`)).getFile();
+    if (file.size !== meta.chunkBytes[k]) throw new Error("The browser cache is incomplete. Choose the parquet files again.");
+    for (let pos = 0; pos < file.size; pos += STAGE) {
+      const part = await file.slice(pos, Math.min(file.size, pos + STAGE)).arrayBuffer();
+      device.queue.writeBuffer(chunkBufs[k], pos, part);
+      done += part.byteLength;
+      setProgress(done / total);
+      setStatus(`loading from browser cache · ${gib(done)} / ${gib(total)}`);
+      await device.queue.onSubmittedWorkDone();
+    }
+  }
+  const index = new Int32Array(await (await (await dir.getFileHandle("index.bin")).getFile()).arrayBuffer());
+  return { meta, index, chunkBufs, seconds: (performance.now() - t0) / 1000 };
+}
+
+// ---------- start screen: wait for files or the cache ----------
+const cube = await new Promise((resolve) => {
+  const go = async (load) => {
+    $("start").style.display = "none";
+    try { resolve(await load()); }
+    catch (e) { fail(`${e.message}<br><br><button onclick="location.reload()">Start again</button>`); }
+  };
+  const pick = (files) => {
+    files = [...files].filter((f) => f.name.endsWith(".parquet"));
+    if (files.length) go(() => ingestParquet(files));
+  };
+  $("files").onchange = (e) => pick(e.target.files);
+  const drop = $("drop");
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); pick(e.dataTransfer.files); };
+  readCacheMeta().then((meta) => {
+    if (!meta) return;
+    const size = meta.chunkBytes.reduce((a, b) => a + b, 0);
+    $("cacheInfo").innerHTML =
+      `<div class="cache"><div><b>Saved in this browser</b><br>${meta.source}<br>${fmt(meta.rows)} rows · ${meta.dates[0]} → ${meta.dates.at(-1)} · ${gib(size)}</div>` +
+      `<div class="btns"><button id="openCache" class="primary">Open</button><button id="dropCache">Delete</button></div></div>`;
+    $("openCache").onclick = () => go(() => loadCache(meta));
+    $("dropCache").onclick = async () => { await clearCache(); $("cacheInfo").innerHTML = ""; };
+  });
+  setStatus(`${gpuName} · waiting for data`);
+});
+
+const meta = cube.meta;
+const T = meta.tickers.length, D = meta.dates.length, NF = meta.features.length, NT = meta.targets.length;
+const NC = NF + NT, L = Math.ceil(T / TEX_W), index = cube.index, chunkBufs = cube.chunkBufs, K = chunkBufs.length;
+const columns = meta.columns.map((c) => c.name);
+const tasks = new Uint32Array(MAX_TASKS * 4);  // per task: chunk, byte base, rows
+meta.tasks.forEach(([chunk, base, rows], i) => tasks.set([chunk, base, rows, 0], i * 4));
+
+// Feature families are contiguous runs (intelligence_1.., charisma_.., …) followed by the named signals features.
+const featureGroups = [];
+meta.features.forEach((f, i) => {
+  const name = f.match(/^feature_([a-z]+)_\d+$/)?.[1] ?? "signals";
+  if (featureGroups.at(-1)?.name === name) featureGroups.at(-1).end = i + 1;
+  else featureGroups.push({ name, start: i, end: i + 1 });
+});
+
+// ---------- row index texture: (ticker, date) -> task << 20 | row within task, -1 = no row ----------
 const indexAt = (t, d) => index[(((t / TEX_W) | 0) * D + d) * TEX_W + (t % TEX_W)];
 const idxTex = device.createTexture({ size: [TEX_W, D, L], format: "r32sint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
 device.queue.writeTexture({ texture: idxTex }, index, { bytesPerRow: TEX_W * 4, rowsPerImage: D }, [TEX_W, D, L]);
+const taskBuf = device.createBuffer({ size: tasks.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+device.queue.writeBuffer(taskBuf, 0, tasks);
 
 // ---------- ticker orderings (position on X -> ticker id) ----------
 const permTex = device.createTexture({ size: [TEX_W, L], format: "r32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-let perm = new Uint32Array(TEX_W * L), inv = new Uint32Array(T);
+let perm = new Uint32Array(T), inv = new Uint32Array(T), tickerGroups = [];  // country runs, when ordered by country
 function setOrder(kind) {
-  const ids = Array.from({ length: T }, (_, i) => i);  // tickers are stored alphabetically
-  const fs = meta.first_seen, co = meta.country;
-  if (kind === "first") ids.sort((a, b) => (fs[a] < fs[b] ? -1 : fs[a] > fs[b] ? 1 : a - b));
-  if (kind === "country") ids.sort((a, b) => (co[a] < co[b] ? -1 : co[a] > co[b] ? 1 : fs[a] < fs[b] ? -1 : fs[a] > fs[b] ? 1 : a - b));
-  perm = new Uint32Array(TEX_W * L);
-  ids.forEach((id, pos) => { perm[pos] = id; inv[id] = pos; });
-  device.queue.writeTexture({ texture: permTex }, perm, { bytesPerRow: TEX_W * 4 }, [TEX_W, L]);
+  const ids = Array.from({ length: T }, (_, i) => i);
+  const fs = meta.first_seen, co = meta.country, nm = meta.tickers;
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  if (kind === "alpha") ids.sort((a, b) => cmp(nm[a], nm[b]));
+  if (kind === "first") ids.sort((a, b) => cmp(fs[a], fs[b]) || cmp(nm[a], nm[b]));
+  if (kind === "country") ids.sort((a, b) => cmp(co[a], co[b]) || cmp(fs[a], fs[b]) || cmp(nm[a], nm[b]));
+  const texData = new Uint32Array(TEX_W * L);
+  tickerGroups = [];
+  ids.forEach((id, pos) => {
+    perm[pos] = texData[pos] = id;
+    inv[id] = pos;
+    if (kind !== "country") return;
+    if (tickerGroups.at(-1)?.name === co[id]) tickerGroups.at(-1).end = pos + 1;
+    else tickerGroups.push({ name: co[id], start: pos, end: pos + 1 });
+  });
+  device.queue.writeTexture({ texture: permTex }, texData, { bytesPerRow: TEX_W * 4 }, [TEX_W, L]);
 }
-
-// ---------- value buffers ----------
-device.pushErrorScope("out-of-memory");
-const chunkBufs = chunks.map((c) => device.createBuffer({
-  size: Math.ceil(c.bytes / 4) * 4,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-}));
-const oom = await device.popErrorScope();
-if (oom) fail(`Not enough GPU memory for ${(chunks.reduce((s, c) => s + c.bytes, 0) / 2 ** 30).toFixed(1)} GiB of cells: ${oom.message}`);
 
 // ---------- colours ----------
 const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
 const colors = new Float32Array(260 * 4);
-for (let v = 0; v <= 254; v++) {
-  let i = 0;
-  while (i < 3 && v > BIN_BYTES[i + 1]) i++;
-  const f = (v - BIN_BYTES[i]) / (BIN_BYTES[i + 1] - BIN_BYTES[i]);
-  const a = hex(RAMP[i]), b = hex(RAMP[i + 1]);
-  colors.set([0, 1, 2].map((k) => a[k] + (b[k] - a[k]) * f).concat(1), v * 4);
+function fillRamp() {
+  const ramp = PALETTES[palette];
+  for (let v = 0; v <= 254; v++) {
+    let i = 0;
+    while (i < 3 && v > BIN_BYTES[i + 1]) i++;
+    const f = (v - BIN_BYTES[i]) / (BIN_BYTES[i + 1] - BIN_BYTES[i]);
+    const a = hex(ramp[i]), b = hex(ramp[i + 1]);
+    colors.set([0, 1, 2].map((k) => a[k] + (b[k] - a[k]) * f).concat(1), v * 4);
+  }
 }
-[[255, NULL_FG], [256, EMPTY], [257, NULL_BG], [258, LOADING]].forEach(([i, h]) => colors.set([...hex(h), 1], i * 4));
+fillRamp();
+[[255, NULL_FG], [256, EMPTY], [257, NULL_BG]].forEach(([i, h]) => colors.set([...hex(h), 1], i * 4));
 
 // ---------- shaders ----------
 const UNIFORM_WGSL = /* wgsl */`
@@ -117,18 +394,20 @@ struct U {
   box: vec4f,     // WX, WF, WT, WZ
   slice: vec4f,   // ticker pos centre, signed Y cell centre (targets < 0), date centre
   dims: vec4u,    // T, NF, NT, D
-  misc: vec4u,    // NC, flags (1 hide empty, 2/4/8 date/feature/ticker plane visible), max samples, loaded dates
+  misc: vec4u,    // NC, flags (2/4/8 date/feature/ticker plane visible), max samples, unused
   hover: vec4i,   // ticker pos, column, date, active
-  colors: array<vec4f, 260>,  // 0..254 ramp, 255 null, 256 empty, 257 null background, 258 loading
+  mask: vec4u,    // hidden by the legend (bits 0-4 bins, 5 null, 6 no row)
+  colors: array<vec4f, 260>,  // 0..254 ramp, 255 null, 256 empty, 257 null background
 };
 @group(0) @binding(0) var<uniform> u: U;
 `;
-const chunkDecls = chunks.map((_, k) => `@group(0) @binding(${3 + k}) var<storage, read> c${k}: array<u32>;`).join("\n");
-const chunkSwitch = chunks.map((_, k) => `if (c == ${k}u) { return c${k}[w]; }`).join(" else ") + " return 0u;";
+const chunkDecls = chunkBufs.map((_, k) => `@group(0) @binding(${4 + k}) var<storage, read> c${k}: array<u32>;`).join("\n");
+const chunkSwitch = chunkBufs.map((_, k) => `if (c == ${k}u) { return c${k}[w]; }`).join(" else ") + " return 0u;";
 
 const planeWGSL = UNIFORM_WGSL + /* wgsl */`
 @group(0) @binding(1) var idxTex: texture_2d_array<i32>;
 @group(0) @binding(2) var permTex: texture_2d<u32>;
+@group(0) @binding(3) var<uniform> tasks: array<vec4u, ${MAX_TASKS}>;  // chunk, byte base, rows
 ${chunkDecls}
 
 fn word(c: u32, w: u32) -> u32 { ${chunkSwitch} }
@@ -141,7 +420,7 @@ struct VOut {
 
 fn sliceWorld() -> vec3f {
   let y = select(u.slice.y / f32(u.dims.z) * u.box.z, u.slice.y / f32(u.dims.y) * u.box.y, u.slice.y >= 0.0);
-  return vec3f(u.slice.x / f32(u.dims.x) * u.box.x, y, u.slice.z / f32(u.dims.w) * u.box.w);
+  return vec3f(u.slice.x / f32(u.dims.x) * u.box.x, y, (1.0 - u.slice.z / f32(u.dims.w)) * u.box.w);
 }
 
 @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) plane: u32) -> VOut {
@@ -161,10 +440,10 @@ fn sliceWorld() -> vec3f {
   return o;
 }
 
-// world -> continuous cell coords (ticker pos, signed Y cell, date)
+// world -> continuous cell coords (ticker pos, signed Y cell, date); dates run from z = WZ (oldest) to z = 0
 fn toCell(w: vec3f) -> vec3f {
   let y = select(w.y / u.box.z * f32(u.dims.z), w.y / u.box.y * f32(u.dims.y), w.y >= 0.0);
-  return vec3f(w.x / u.box.x * f32(u.dims.x), y, w.z / u.box.w * f32(u.dims.w));
+  return vec3f(w.x / u.box.x * f32(u.dims.x), y, (1.0 - w.z / u.box.w) * f32(u.dims.w));
 }
 
 fn cellIds(q: vec3f) -> vec3u {
@@ -176,15 +455,14 @@ fn cellIds(q: vec3f) -> vec3u {
   return vec3u(tp, col, d);
 }
 
-// 0..255 = stored byte, 256 = no row for this ticker/date, 258 = not loaded yet
+// 0..255 = stored byte, 256 = no row for this ticker/date. Each task's bytes are column-major.
 fn cellValue(id: vec3u) -> u32 {
-  if (id.z >= u.misc.w) { return 258u; }
   let t = textureLoad(permTex, vec2i(i32(id.x % 8192u), i32(id.x / 8192u)), 0).r;
   let packed = textureLoad(idxTex, vec2i(i32(t % 8192u), i32(id.z)), i32(t / 8192u), 0).r;
   if (packed < 0) { return 256u; }
-  let c = u32(packed) >> 24u;
-  let b = (u32(packed) & 0xFFFFFFu) * u.misc.x + id.y;
-  return (word(c, b >> 2u) >> ((b & 3u) * 8u)) & 0xFFu;
+  let task = tasks[u32(packed) >> 20u];
+  let b = task.y + id.y * task.z + (u32(packed) & 0xFFFFFu);
+  return (word(task.x, b >> 2u) >> ((b & 3u) * 8u)) & 0xFFu;
 }
 
 fn colorOf(v: u32, q: vec3f) -> vec3f {
@@ -192,6 +470,14 @@ fn colorOf(v: u32, q: vec3f) -> vec3f {
     return select(u.colors[257].rgb, u.colors[255].rgb, fract((q.x + q.y + q.z) * 2.0) < 0.35);
   }
   return u.colors[v].rgb;
+}
+
+// Hidden by the legend toggles? Continuous values count as the bin colour they are nearest to.
+fn hidden(v: u32) -> bool {
+  var bit = u32(round(f32(v) / 63.5));
+  if (v == 255u) { bit = 5u; }
+  if (v == 256u) { bit = 6u; }
+  return (u.mask.x & (1u << bit)) != 0u;
 }
 
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
@@ -202,19 +488,20 @@ fn colorOf(v: u32, q: vec3f) -> vec3f {
   // Average n x n samples over the pixel footprint when a pixel covers many cells.
   let n = u32(clamp(ceil(max(length(dx), length(dy))), 1.0, f32(u.misc.z)));
   var acc = vec3f(0.0);
-  var filled = 0.0;
+  var shown = 0.0;
   for (var a = 0u; a < n; a++) {
     for (var b = 0u; b < n; b++) {
       let o = (vec2f(f32(a), f32(b)) + 0.5) / f32(n) - 0.5;
       let qs = q + dx * o.x + dy * o.y;
       let v = cellValue(cellIds(qs));
-      acc += colorOf(v, qs);
-      filled += select(1.0, 0.0, v == 256u);
+      if (!hidden(v)) {
+        acc += colorOf(v, qs);
+        shown += 1.0;
+      }
     }
   }
-  let nn = f32(n * n);
-  if ((u.misc.y & 1u) != 0u && filled < nn * 0.5) { discard; }
-  var col = acc / nn;
+  if (shown < f32(n * n) * 0.5) { discard; }
+  var col = acc / shown;
   let gx = length(vec2f(dx.x, dy.x));
   let gy = length(vec2f(dx.y, dy.y));
   let gz = length(vec2f(dx.z, dy.z));
@@ -268,10 +555,10 @@ const linePipe = device.createRenderPipeline({
   depthStencil: depth,
 });
 
-const UBYTES = 144 + 260 * 16;
+const UBYTES = 160 + 260 * 16;
 const ubuf = device.createBuffer({ size: UBYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 const uData = new ArrayBuffer(UBYTES), uF = new Float32Array(uData), uU = new Uint32Array(uData), uI = new Int32Array(uData);
-uF.set(colors, 144 / 4);
+uF.set(colors, 160 / 4);
 
 const planeBG = device.createBindGroup({
   layout: planePipe.getBindGroupLayout(0),
@@ -279,7 +566,8 @@ const planeBG = device.createBindGroup({
     { binding: 0, resource: { buffer: ubuf } },
     { binding: 1, resource: idxTex.createView({ dimension: "2d-array" }) },
     { binding: 2, resource: permTex.createView() },
-    ...chunkBufs.map((buffer, k) => ({ binding: 3 + k, resource: { buffer } })),
+    { binding: 3, resource: { buffer: taskBuf } },
+    ...chunkBufs.map((buffer, k) => ({ binding: 4 + k, resource: { buffer } })),
   ],
 });
 const lineBG = device.createBindGroup({ layout: linePipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubuf } }] });
@@ -299,8 +587,10 @@ device.queue.writeBuffer(boxBuf, 0, new Float32Array(boxPts));
 const state = {
   date: 0, col: 0, tick: 0,         // tick = ticker id
   show: [true, true, true],         // date, feature, ticker planes
-  hideEmpty: false, quality: 5, loadedD: 0,
+  quality: 5,
+  hiddenMask: 0,                    // legend toggles: bits 0-4 bins, 5 null, 6 no row
   hover: null,                      // {tp, col, d}
+  pinned: null,                     // clicked cell; freezes the readout while set
   interacting: false,
 };
 const cam = { target: [WX / 2, (WF - WT) / 2, WZ / 2], dist: 6.4, yaw: 0.62, pitch: 0.38, fov: (40 * Math.PI) / 180 };
@@ -354,7 +644,8 @@ function project(M, p) {
 }
 
 // JS mirror of the shader's coordinate mapping
-const toCell = (w) => [w[0] / WX * T, w[1] >= 0 ? w[1] / WF * NF : w[1] / WT * NT, w[2] / WZ * D];
+const toCell = (w) => [w[0] / WX * T, w[1] >= 0 ? w[1] / WF * NF : w[1] / WT * NT, (1 - w[2] / WZ) * D];
+const dateZ = (d) => (1 - d / D) * WZ;
 const cellIds = (q) => {
   const tp = Math.min(Math.max(Math.floor(q[0]), 0), T - 1);
   const col = q[1] >= 0 ? Math.min(Math.floor(q[1]), NF - 1) : NF + Math.min(Math.floor(-q[1]), NT - 1);
@@ -363,7 +654,7 @@ const cellIds = (q) => {
 };
 const sliceWorld = () => {
   const s = sliceCell();
-  return [s[0] / T * WX, s[1] >= 0 ? s[1] / NF * WF : s[1] / NT * WT, s[2] / D * WZ];
+  return [s[0] / T * WX, s[1] >= 0 ? s[1] / NF * WF : s[1] / NT * WT, dateZ(s[2])];
 };
 
 // Ray from mouse -> nearest visible slice hit
@@ -408,10 +699,11 @@ function render() {
   uF.set([WX, WF, WT, WZ], 16);
   uF.set([...sliceCell(), 0], 20);
   uU.set([T, NF, NT, D], 24);
-  const flags = (state.hideEmpty ? 1 : 0) | (state.show[0] ? 2 : 0) | (state.show[1] ? 4 : 0) | (state.show[2] ? 8 : 0);
-  uU.set([NC, flags, state.interacting ? Math.min(2, state.quality) : state.quality, state.loadedD], 28);
+  const flags = (state.show[0] ? 2 : 0) | (state.show[1] ? 4 : 0) | (state.show[2] ? 8 : 0);
+  uU.set([NC, flags, state.interacting ? Math.min(2, state.quality) : state.quality, 0], 28);
   const hv = state.hover;
   uI.set(hv ? [hv.tp, hv.col, hv.d, 1] : [0, 0, 0, 0], 32);
+  uU.set([state.hiddenMask, 0, 0, 0], 36);
   device.queue.writeBuffer(ubuf, 0, uData);
 
   const enc = device.createCommandEncoder();
@@ -437,28 +729,41 @@ const labelsEl = $("labels");
 const labelPool = [];
 function drawLabels(M) {
   const items = [
-    [[WX / 2, -WT, -0.12], "tickers (X) →"],
+    [[WX / 2, -WT, -0.12], "tickers (X)"],
     [[-0.1, WF / 2, 0], "features ↑"],
     [[-0.1, -WT / 2, 0], "targets ↓"],
-    [[-0.32, -WT, WZ / 2], "dates (Z) →"],
+    [[-0.32, -WT, WZ / 2], "dates (Z)"],
   ];
   let lastYear = "";
   meta.dates.forEach((dt, d) => {
     const y = dt.slice(0, 4);
-    if (y !== lastYear && +y % 2 === 1) items.push([[-0.04, -WT - 0.04, (d / D) * WZ], y]);
+    if (y !== lastYear && +y % 2 === 1) items.push([[-0.04, -WT - 0.04, dateZ(d)], y]);
     lastYear = y;
   });
+  // Group labels along the front edges, only where the group is wide enough on screen to read.
+  const span = (a, b) => {
+    const pa = project(M, a), pb = project(M, b);
+    return pa && pb ? Math.hypot(pa[0] - pb[0], pa[1] - pb[1]) : 0;
+  };
+  for (const g of tickerGroups) {
+    const x0 = (g.start / T) * WX, x1 = (g.end / T) * WX;
+    if (span([x0, -WT, WZ], [x1, -WT, WZ]) >= 18) items.push([[(x0 + x1) / 2, -WT - 0.03, WZ + 0.03], g.name, "grp"]);
+  }
+  for (const g of featureGroups) {
+    const y0 = (g.start / NF) * WF, y1 = (g.end / NF) * WF;
+    if (span([0, y0, WZ], [0, y1, WZ]) >= 12) items.push([[-0.03, (y0 + y1) / 2, WZ + 0.03], g.name, "grp right"]);
+  }
   const s = sliceWorld();
-  if (state.show[0]) items.push([[WX + 0.06, WF, s[2]], meta.dates[state.date], true]);
-  if (state.show[1]) items.push([[WX + 0.06, s[1], WZ], columns[state.col].replace(/^feature_|^target_/, ""), true]);
-  if (state.show[2]) items.push([[s[0], WF + 0.06, WZ], meta.tickers[state.tick], true]);
-  items.forEach(([p, text, slice], i) => {
+  if (state.show[0]) items.push([[WX + 0.06, WF, s[2]], meta.dates[state.date], "slice"]);
+  if (state.show[1]) items.push([[WX + 0.06, s[1], WZ], columns[state.col].replace(/^feature_|^target_/, ""), "slice"]);
+  if (state.show[2]) items.push([[s[0], WF + 0.06, WZ], meta.tickers[state.tick], "slice"]);
+  items.forEach(([p, text, cls], i) => {
     let el = labelPool[i];
     if (!el) { el = labelPool[i] = document.createElement("div"); labelsEl.appendChild(el); }
     const sp = project(M, p);
     el.style.display = sp ? "" : "none";
     if (!sp) return;
-    el.className = slice ? "lbl slice" : "lbl";
+    el.className = cls ? `lbl ${cls}` : "lbl";
     el.textContent = text;
     el.style.left = `${sp[0]}px`;
     el.style.top = `${sp[1]}px`;
@@ -472,28 +777,60 @@ let reading = false, pendingRead = null;
 function describe(v, col) {
   if (v === 255) return "null";
   const c = meta.columns[col];
-  if (c.kind === "cont") return `≈ ${(c.min + (v / 254) * (c.max - c.min)).toPrecision(4)}  (range ${c.min.toFixed(2)} … ${c.max.toFixed(2)})`;
+  if (c.kind === "cont") return `≈ ${(c.min + (v / 254) * (c.max - c.min)).toPrecision(4)}`;
   const k = BIN_BYTES.indexOf(v);
   return col < NF ? `bin ${k}` : `${k / 4}`;
 }
+// Bloomberg-style "7203 JP" -> Yahoo-style "7203.T", the symbol FMP's keyless logo CDN is keyed by.
+const YAHOO_SUFFIX = { US: "", JP: ".T", HK: ".HK", KR: ".KS", TW: ".TW", GB: ".L", AU: ".AX", CA: ".TO",
+  DE: ".DE", BR: ".SA", SE: ".ST", FR: ".PA", IT: ".MI", SG: ".SI", IN: ".NS", CH: ".SW",
+  NO: ".OL", ZA: ".JO", NL: ".AS", ES: ".MC" };
+function logoUrl(ticker) {
+  let [code, cc] = ticker.split(" ");
+  if (cc === "HK") code = code.padStart(4, "0");
+  const suf = cc === "CN" ? (/^[69]/.test(code) ? ".SS" : ".SZ") : (YAHOO_SUFFIX[cc] ?? "");
+  return `https://financialmodelingprep.com/image-stock/${encodeURIComponent(code.replace("/", "-") + suf)}.png`;
+}
 function showHover(h, text) {
+  if (state.pinned && h !== state.pinned) return;  // a stale hover read finishing after a pin
   const t = perm[h.tp], col = columns[h.col];
+  $("hover").classList.toggle("pinned", !!state.pinned);
   $("hover").innerHTML =
-    `<div><span class="k">ticker</span>${meta.tickers[t]} · ${meta.country[t]}</div>` +
+    `<div class="rows"><div><span class="k">ticker</span>${meta.tickers[t]} · ${meta.country[t]}</div>` +
     `<div><span class="k">date</span>${meta.dates[h.d]} · ${meta.date_type[h.d]}</div>` +
     `<div><span class="k">${h.col < NF ? "feature" : "target"}</span>${col.replace(/^feature_|^target_/, "")}</div>` +
-    `<div><span class="k">value</span><span class="val">${text}</span></div>`;
+    `<div><span class="k">value</span><span class="val">${text}</span></div></div>` +
+    (state.pinned ? `<img class="logo" src="${logoUrl(meta.tickers[t])}" alt="" onerror="this.remove()">` : "");
+}
+function setHover(h) {
+  const key = h && `${h.tp},${h.col},${h.d}`;
+  if (key === state.hoverKey) return;
+  state.hoverKey = key;
+  state.hover = h;
+  if (h) readHover(h);
+  requestRender();
+}
+// Clicking a cell pins it: the readout freezes (so it can be copied) and the company logo loads.
+// Clicking the pinned cell or empty space, or pressing Esc, releases it; clicking another cell moves the pin.
+function togglePin(h) {
+  const was = state.pinned, same = h && was && `${h.tp},${h.col},${h.d}` === state.hoverKey;
+  state.pinned = same ? null : h;
+  state.hoverKey = undefined;  // force setHover to refresh, even to null
+  if (!state.pinned && was) {
+    $("hover").classList.remove("pinned");
+    $("hover").innerHTML = "";
+  }
+  setHover(state.pinned ?? h);
 }
 async function readHover(h) {
   if (reading) { pendingRead = h; return; }
   reading = true;
   try {
-    if (h.d >= state.loadedD) { showHover(h, "loading…"); return; }
     const packed = indexAt(perm[h.tp], h.d);
     if (packed < 0) { showHover(h, "no row (not in universe this week)"); return; }
-    const b = (packed & 0xffffff) * NC + h.col;
+    const ti = (packed >>> 20) * 4, b = tasks[ti + 1] + h.col * tasks[ti + 2] + (packed & 0xfffff);
     const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(chunkBufs[packed >>> 24], Math.floor(b / 4) * 4, readBuf, 0, 4);
+    enc.copyBufferToBuffer(chunkBufs[tasks[ti]], Math.floor(b / 4) * 4, readBuf, 0, 4);
     device.queue.submit([enc.finish()]);
     await readBuf.mapAsync(GPUMapMode.READ);
     const v = new Uint8Array(readBuf.getMappedRange())[b % 4];
@@ -546,28 +883,49 @@ $("tickSearch").onchange = (e) => {
   $(id).onchange = (e) => { state.show[p] = e.target.checked; syncUI(); };
 });
 $("order").onchange = (e) => { setOrder(e.target.value); syncUI(); };
-$("hideEmpty").onchange = (e) => { state.hideEmpty = e.target.checked; requestRender(); };
 $("quality").oninput = (e) => { state.quality = +e.target.value; syncUI(); };
 
+// Legend: every colour is a toggle that hides those cells (bits 0-4 bins, 5 null, 6 no row).
+const nullSwatch = `repeating-linear-gradient(45deg,${NULL_FG} 0 2px,${NULL_BG} 2px 6px)`;
 $("legend").innerHTML =
-  `<div class="bins">${RAMP.map((c, i) => `<div><span class="sw" style="background:${c}"></span>${i}</div>`).join("")}</div>` +
-  `<div class="ends"><span>low</span><span>features: bins 0–4 · targets: 0, .25, .5, .75, 1</span><span>high</span></div>` +
-  `<div class="grad" style="background:linear-gradient(90deg,${RAMP.join(",")})"></div>` +
-  `<div class="ends"><span>min</span><span>22 continuous factors</span><span>max</span></div>` +
-  `<div class="extra"><span><span class="sw" style="background:repeating-linear-gradient(45deg,${NULL_FG} 0 2px,${NULL_BG} 2px 6px)"></span> null</span>` +
-  `<span><span class="sw" style="background:${EMPTY};outline:1px solid #383835"></span> no row</span></div>`;
+  `<div class="bins">${BIN_BYTES.map((_, i) => `<button class="tog" data-bit="${i}" title="show/hide ${i}"><span class="sw"></span><span class="lab">${i}</span></button>`).join("")}</div>` +
+  `<div class="grad"></div>` +
+  `<div class="extra"><button class="tog" data-bit="5"><span class="sw" style="background:${nullSwatch}"></span> <span class="lab">null</span></button>` +
+  `<button class="tog" data-bit="6"><span class="sw" style="background:${EMPTY};outline:1px solid #383835"></span> <span class="lab">no row</span></button></div>`;
+$("legend").querySelectorAll(".tog").forEach((b) => {
+  b.onclick = () => {
+    state.hiddenMask ^= 1 << +b.dataset.bit;
+    b.classList.toggle("off", (state.hiddenMask >> +b.dataset.bit) & 1);
+    b.setAttribute("aria-pressed", String(!b.classList.contains("off")));
+    requestRender();
+  };
+});
+function applyPalette() {
+  const ramp = PALETTES[palette];
+  $("legend").querySelectorAll(".bins .sw").forEach((s, i) => { s.style.background = ramp[i]; });
+  $("legend").querySelector(".grad").style.background = `linear-gradient(90deg,${ramp.join(",")})`;
+  fillRamp();
+  uF.set(colors, 160 / 4);
+  requestRender();
+}
+$("palette").value = palette;
+$("palette").onchange = (e) => {
+  palette = e.target.value;
+  try { localStorage.setItem("palette", palette); } catch {}
+  applyPalette();
+};
+applyPalette();
 
+// Hotkeys: [ ] date, ( ) ticker, { } feature/target; hold ctrl or alt to step by 10.
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" && e.target.type === "text") return;
-  const step = e.shiftKey ? 10 : 1;
+  const step = e.ctrlKey || e.altKey ? 10 : 1;
   const keys = {
     "[": () => setDate(state.date - step), "]": () => setDate(state.date + step),
-    "{": () => setDate(state.date - step), "}": () => setDate(state.date + step),
-    ",": () => setTickPos(inv[state.tick] - step), ".": () => setTickPos(inv[state.tick] + step),
-    "<": () => setTickPos(inv[state.tick] - step), ">": () => setTickPos(inv[state.tick] + step),
-    ";": () => setCol(sliderToCol(colToSlider(state.col) - step)), "'": () => setCol(sliderToCol(colToSlider(state.col) + step)),
-    ":": () => setCol(sliderToCol(colToSlider(state.col) - step)), '"': () => setCol(sliderToCol(colToSlider(state.col) + step)),
+    "(": () => setTickPos(inv[state.tick] - step), ")": () => setTickPos(inv[state.tick] + step),
+    "{": () => setCol(sliderToCol(colToSlider(state.col) - step)), "}": () => setCol(sliderToCol(colToSlider(state.col) + step)),
     r: () => { Object.assign(cam, structuredClone(camHome)); requestRender(); },
+    Escape: () => state.pinned && togglePin(null),
   };
   if (keys[e.key]) { keys[e.key](); e.preventDefault(); }
 });
@@ -578,7 +936,7 @@ canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 canvas.addEventListener("pointerdown", (e) => {
   canvas.setPointerCapture(e.pointerId);
   const mode = e.ctrlKey ? "slice" : e.button === 2 || e.shiftKey ? "pan" : "orbit";
-  drag = { mode, x: e.offsetX, y: e.offsetY };
+  drag = { mode, x: e.offsetX, y: e.offsetY, x0: e.offsetX, y0: e.offsetY, click: mode === "orbit" && e.button === 0 };
   if (mode === "slice") {
     const hit = pick(e.offsetX, e.offsetY);
     if (!hit) { drag = null; return; }
@@ -595,16 +953,10 @@ canvas.addEventListener("pointerdown", (e) => {
 });
 canvas.addEventListener("pointermove", (e) => {
   if (!drag) {
-    const h = pick(e.offsetX, e.offsetY);
-    const key = h && `${h.tp},${h.col},${h.d}`;
-    if (key !== state.hoverKey) {
-      state.hoverKey = key;
-      state.hover = h;
-      if (h) readHover(h);
-      requestRender();
-    }
+    if (!state.pinned) setHover(pick(e.offsetX, e.offsetY));
     return;
   }
+  if (Math.hypot(e.offsetX - drag.x0, e.offsetY - drag.y0) > 4) drag.click = false;
   const dx = e.offsetX - drag.x, dy = e.offsetY - drag.y;
   if (drag.mode === "orbit") {
     cam.yaw -= dx * 0.005;
@@ -630,7 +982,10 @@ canvas.addEventListener("pointermove", (e) => {
   requestRender();
 });
 const endDrag = () => { drag = null; state.interacting = false; requestRender(); };
-canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointerup", (e) => {
+  if (drag?.click) togglePin(pick(e.offsetX, e.offsetY));
+  endDrag();
+});
 canvas.addEventListener("pointercancel", endDrag);
 canvas.addEventListener("wheel", (e) => {
   e.preventDefault();
@@ -642,57 +997,12 @@ canvas.addEventListener("wheel", (e) => {
   requestRender();
 }, { passive: false });
 
-// ---------- initial state, then stream all values onto the GPU ----------
+// ---------- initial state ----------
 setOrder("first");
 state.date = Math.floor(D / 2);
 state.col = Math.floor(NF / 2);
 state.tick = tickerId.get("AAPL US") ?? perm[0];
 syncUI();
-
-const totalBytes = chunks.reduce((s, c) => s + c.bytes, 0);
-setStatus(`${gpuName} · loading ${(totalBytes / 2 ** 30).toFixed(2)} GiB into ${K} GPU buffers…`);
-const t0 = performance.now();
-let maxDateBytes = 0;
-for (let d = 0; d < D; d++) maxDateBytes = Math.max(maxDateBytes, (offs[d + 1] - offs[d]) * NC);
-const stage = new Uint8Array(STAGE + maxDateBytes + 4);
-let fill = 0, chunkI = 0, chunkOff = 0, loadedBytes = 0;
-function advanceLoaded() {
-  while (state.loadedD < D && (dateChunk[state.loadedD] < chunkI || (dateChunk[state.loadedD] === chunkI && dateEnd[state.loadedD] <= chunkOff))) state.loadedD++;
-}
-async function flush(final) {
-  const n = final ? Math.ceil(fill / 4) * 4 : STAGE;
-  if (n === 0) return;
-  if (final) stage.fill(0, fill, n);
-  device.queue.writeBuffer(chunkBufs[chunkI], chunkOff, stage, 0, n);
-  chunkOff += n;
-  if (final) fill = 0;
-  else { stage.copyWithin(0, STAGE, fill); fill -= STAGE; }
-  await device.queue.onSubmittedWorkDone();  // keep the upload queue from ballooning
-  advanceLoaded();
-  requestRender();
-}
-const fetchDate = (d) => fetch(`${DATA}values/${String(d).padStart(4, "0")}.u8`).then((r) => {
-  if (!r.ok) throw new Error(`values ${d}: HTTP ${r.status}`);
-  return r.arrayBuffer();
-});
-const inflight = new Map();
-let next = 0;
-const CONCURRENCY = 6;
-for (; next < Math.min(CONCURRENCY, D); next++) inflight.set(next, fetchDate(next));
-for (let d = 0; d < D; d++) {
-  const buf = new Uint8Array(await inflight.get(d));
-  inflight.delete(d);
-  if (next < D) { inflight.set(next, fetchDate(next)); next++; }
-  if (dateChunk[d] !== chunkI) { await flush(true); chunkI = dateChunk[d]; chunkOff = 0; }
-  stage.set(buf, fill);
-  fill += buf.length;
-  loadedBytes += buf.length;
-  if (fill >= STAGE) await flush(false);
-  if (d % 16 === 0) setProgress(loadedBytes / totalBytes);
-}
-await flush(true);
-state.loadedD = D;
 setProgress(1);
-const secs = (performance.now() - t0) / 1000;
-setStatus(`${gpuName} · ${(totalBytes / 2 ** 30).toFixed(2)} GiB in ${K} buffers · ${offs[D].toLocaleString()} rows × ${NC} columns · loaded in ${secs.toFixed(1)}s`);
-requestRender();
+setStatus(`${gpuName} · ${fmt(meta.rows)} rows × ${NC} columns · ${gib(meta.chunkBytes.reduce((a, b) => a + b, 0))} in ${K} buffers · ready in ${cube.seconds.toFixed(1)}s`);
+$("source").textContent = meta.source;

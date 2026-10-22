@@ -1,6 +1,6 @@
 """Build the viewer's built-in demo: one slice per axis of the Numerai v6.0 cube.
 
-  uv run python scripts/build_demo.py [--date 2020-03-20] [--column feature_market_cap_factor] [--ticker "AAPL US"]
+  uv run python scripts/build_demo.py [--date 2020-03-20] [--column feature_charisma_137] [--ticker "AAPL US"]
 
 Writes viewer/demo/:
   meta.json     tickers, countries, dates, columns (with min/max), and the chosen slices
@@ -29,7 +29,7 @@ NULL = 255
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--date", default="2020-03-20")
-ap.add_argument("--column", default="feature_market_cap_factor")
+ap.add_argument("--column", default="feature_charisma_137")
 ap.add_argument("--ticker", default="AAPL US")
 args = ap.parse_args()
 

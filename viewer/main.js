@@ -712,7 +712,7 @@ function startViewer(cube) {
     pinned: null,                     // clicked cell; freezes the readout while set
     interacting: false,
   };
-  // The demo starts higher, looking down onto its feature slice (the named factors sit near the top of Y).
+  // The demo starts higher, looking down onto its feature slice so it reads as a floor under the other two.
   // On tall screens (phones) the start distance grows until the whole box fits the narrower horizontal view.
   function homeCam() {
     const fov = (40 * Math.PI) / 180, aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
@@ -962,7 +962,7 @@ function startViewer(cube) {
   }
   async function readCellNow(t, d, col) {
     const packed = indexAt(t, d);
-    if (packed < 0) return "no row (not in universe this week)";
+    if (packed < 0) return "no row";
     const ti = (packed >>> 20) * 4, only = tasks[ti + 3];
     if (only && only !== col + 1) return "not in the demo";
     const wide = layout.wide[col], off = only ? 0 : layout.off[col];

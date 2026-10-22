@@ -1,5 +1,5 @@
 // Decodes one range of rows (within one row group) from a Numerai parquet file and encodes it for the GPU.
-// Output is column-major: byte [c * rows + r] = column c of row r, on the shared 0..254 ramp (255 = null).
+// Each column is encoded to bytes on the shared 0..254 ramp (255 = null), then packed as in layout.js.
 //
 // Fast path: Numerai files are flat, Snappy-compressed, dictionary-encoded v1 data pages, so pages are
 // decoded straight into output bytes through a dictionary -> byte lookup table, with no JS arrays.
@@ -8,6 +8,7 @@ import { parquetMetadataAsync, parquetRead } from "./vendor/hyparquet/index.js";
 import { deserializeTCompactProtocol } from "./vendor/hyparquet/thrift.js";
 import { snappyUncompress } from "./vendor/hyparquet/snappy.js";
 import { readRleBitPackedHybrid } from "./vendor/hyparquet/encoding.js";
+import { columnLayout, packColumn, taskBytes } from "./layout.js";
 
 const BIN = [0, 64, 127, 191, 254];
 const KIND_BIN = 0, KIND_TARGET = 1;          // anything else is continuous
@@ -194,7 +195,9 @@ onmessage = async ({ data: job }) => {
     const selStart = rowStart - groupStart, selEnd = rowEnd - groupStart;
     const elements = new Map(metadata.schema.map((e) => [e.name, e]));
 
-    const out = new Uint8Array(Math.ceil((n * columns.length) / 4) * 4);
+    const layout = columnLayout(kinds), col = new Uint8Array(n);
+    const out = new Uint8Array(taskBytes(layout.perRow, n));
+    const pack = (c, src) => packColumn(out, 0, layout.off[c], layout.wide[c], n, src);
     const strings = {}, fallback = [];
     for (const name of STRING_COLUMNS) {
       if (!chunks.has(name)) continue;
@@ -202,15 +205,17 @@ onmessage = async ({ data: job }) => {
       catch (e) { if (!(e instanceof Unsupported)) throw e; fallback.push(name); }
     }
     columns.forEach((name, c) => {
-      try { decodeNumeric(u8, view, a, chunks.get(name), elements.get(name), out, c * n, byteEncoder(kinds[c], lo[c], hi[c]), selStart, selEnd); }
-      catch (e) { if (!(e instanceof Unsupported)) throw e; fallback.push(name); }
+      try {
+        decodeNumeric(u8, view, a, chunks.get(name), elements.get(name), col, 0, byteEncoder(kinds[c], lo[c], hi[c]), selStart, selEnd);
+        pack(c, col);
+      } catch (e) { if (!(e instanceof Unsupported)) throw e; fallback.push(name); }
     });
 
     // Generic path for anything the fast path doesn't handle, a few columns at a time to bound JS heap use.
     // It reads whole row groups and selects rows here: hyparquet misplaces rows for reads starting mid-group.
     if (fallback.length) {
       const colIndex = new Map(columns.map((name, i) => [name, i]));
-      const raw = {};
+      const raw = {}, cols = new Map();  // string columns as values, numeric ones as ramp bytes
       const source = { byteLength: file.size, slice: (s, e = file.size) => (s >= a && e <= b ? block.slice(s - a, e - a) : file.slice(s, e).arrayBuffer()) };
       const groupEnd = groupStart + Number(metadata.row_groups[g].num_rows);
       for (let i = 0; i < fallback.length; i += COLUMN_BATCH) {
@@ -225,12 +230,16 @@ onmessage = async ({ data: job }) => {
               if (r < selStart || r >= selEnd) continue;
               const v = columnData[j];
               if (dst) dst[r - selStart] = v;
-              else out[c * n + r - selStart] = v == null ? 255 : toByte(v);
+              else {
+                if (!cols.has(c)) cols.set(c, new Uint8Array(n));
+                cols.get(c)[r - selStart] = v == null ? 255 : toByte(v);
+              }
             }
           },
         });
       }
       for (const [name, values] of Object.entries(raw)) strings[name] = codeStrings(values);
+      for (const [c, bytes] of cols) pack(c, bytes);
     }
 
     // Rows are date-sorted within a file, so first/last occurrence give each ticker's first/last date here.

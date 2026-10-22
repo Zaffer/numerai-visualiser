@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Numerai Cube</title>
 <style>
   :root {
@@ -19,10 +19,21 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--page); color: var(--text-primary);
-    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
-  #wrap { display: flex; height: 100%; }
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; overscroll-behavior: none; }
+  #wrap { position: relative; display: flex; height: 100%; }
   #stage { position: relative; flex: 1; min-width: 0; }
-  canvas { display: block; width: 100%; height: 100%; outline: none; }
+  canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+  .iconbtn { position: absolute; right: 10px; z-index: 6; width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
+    background: color-mix(in srgb, var(--surface) 85%, transparent); border-radius: 8px; }
+  .iconbtn svg { width: 20px; height: 20px; fill: none; stroke: var(--text-secondary); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  #cog { top: 10px; }
+  #home { top: 52px; }
+  body.collapsed #panel { display: none; }
+  #stage > #hoverBox { position: absolute; left: 10px; bottom: 10px; z-index: 4; width: min(320px, calc(100% - 20px));
+    pointer-events: none; }
+  #stage > #hoverBox h2, #stage > #hoverBox .help { display: none; }
+  #stage > #hoverBox #hover:empty { display: none; }
+  #stage > #hoverBox #hover { min-height: 0; background: color-mix(in srgb, var(--surface-2) 92%, transparent); }
   #labels { position: absolute; inset: 0; pointer-events: none; }
   .lbl { position: absolute; transform: translate(-50%, -50%); white-space: nowrap; font-size: 12px;
     color: var(--text-muted); text-shadow: 0 0 3px var(--page), 0 0 3px var(--page); }
@@ -75,11 +86,27 @@
     border-radius: 4px; padding: 4px 12px; cursor: pointer; }
   button:hover { border-color: var(--text-muted); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  #start { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px;
-    background: var(--page); overflow-y: auto; }
-  #start .card { max-width: 520px; width: 100%; background: var(--surface); border: 1px solid var(--hairline);
+  #start { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; padding: 16px;
+    background: rgb(0 0 0 / .6); overflow-y: auto; }
+  #start[hidden] { display: none; }
+  #start .card { position: relative; max-width: 520px; width: 100%; background: var(--surface); border: 1px solid var(--hairline);
     border-radius: 8px; padding: 22px 24px; }
   #start h2 { margin-top: 0; }
+  #closePopup { position: absolute; top: 10px; right: 10px; width: 30px; height: 30px; padding: 0; font-size: 18px; line-height: 1; }
+  #start.busy #drop, #start.busy #cacheInfo, #start.busy #closePopup { pointer-events: none; opacity: .4; }
+  #popStatus { color: var(--text-muted); font-size: 12px; min-height: 1.4em; }
+  #popBar { height: 3px; background: var(--hairline); border-radius: 2px; margin: 6px 0; overflow: hidden; }
+  #popBar div { height: 100%; width: 0; background: var(--accent); }
+  #start:not(.busy) #popStatus, #start:not(.busy) #popBar { display: none; }
+  #popErr { color: #f0948d; }
+  #popErr:empty { display: none; }
+  #demoNote { margin: 0 0 6px; }
+  input:disabled, select:disabled { opacity: .45; }
+  @media (max-width: 720px) {
+    #panel { position: absolute; top: 0; right: 0; bottom: 0; z-index: 5; width: min(340px, 88vw); padding-top: 56px;
+      box-shadow: -8px 0 24px rgb(0 0 0 / .5); }
+    #stage > #hoverBox { bottom: max(10px, env(safe-area-inset-bottom)); }
+  }
   #start p { color: var(--text-secondary); margin: 8px 0; }
   #start code { color: var(--text-primary); font-size: 12px; }
   #drop { display: block; margin: 14px 0; padding: 26px 16px; text-align: center; border: 1.5px dashed var(--axis);
@@ -99,14 +126,24 @@
     <canvas id="gpu" tabindex="0"></canvas>
     <div id="labels"></div>
     <div id="err"></div>
-    <div id="start">
+    <button id="cog" class="iconbtn" aria-label="Settings" aria-controls="panel" title="Settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+    <button id="home" class="iconbtn" aria-label="Reset view" title="Reset view (r)">
+      <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+    </button>
+    <div id="start" hidden>
       <div class="card">
-        <h2>Load the data</h2>
+        <button id="closePopup" aria-label="Close">×</button>
+        <h2>Load data files</h2>
         <p>Choose the Numerai v6.0 parquet files you downloaded: <code>train.parquet</code>, <code>validation.parquet</code>,
           <code>live.parquet</code>, or any subset. They are decoded here in your browser and never uploaded.</p>
         <label id="drop"><input type="file" id="files" accept=".parquet" multiple>Choose files or drop them here</label>
         <div id="cacheInfo"></div>
         <div class="chk"><label><input type="checkbox" id="useCache" checked> keep a copy in this browser for next time</label></div>
+        <p id="popErr"></p>
+        <div id="popStatus"></div>
+        <div id="popBar"><div></div></div>
         <p class="help">Download with <a href="https://github.com/numerai/numerapi" style="color:inherit">numerapi</a>:
           <code>napi.download_dataset("v6.0/validation.parquet")</code>. Needs a WebGPU browser (Chrome or Edge) and GPU memory
           for the cells: about 7 GB for everything, about 3 GB for validation alone.</p>
@@ -119,13 +156,17 @@
     <div id="status">starting…</div>
     <div id="bar"><div></div></div>
     <div id="source"></div>
-    <button onclick="location.reload()" style="margin-top:8px">Load other files</button>
+    <button id="loadData" class="primary" style="margin-top:8px">Load data files</button>
 
-    <h2>Hover</h2>
-    <div id="hover"></div>
-    <div class="help" id="hoverHelp">hover for details · click to pin · esc to release</div>
+    <div id="hoverSlot" hidden></div>
+    <div id="hoverBox">
+      <h2>Hover</h2>
+      <div id="hover"></div>
+      <div class="help" id="hoverHelp">hover for details · click or tap to pin · esc to release</div>
+    </div>
 
     <h2>Slices</h2>
+    <p class="help" id="demoNote" hidden>The demo has one slice per axis. Load data files to move through all of it.</p>
     <label class="row">Date (Z) <span class="val" id="dateLbl"></span></label>
     <input type="range" id="date" min="0" max="0" value="0">
     <label class="row">Feature / target (Y) <span class="val" id="colLbl"></span></label>
@@ -162,6 +203,7 @@
     <h2>Controls</h2>
     <div class="help">
       <b>drag</b> orbit · <b>right</b> pan · <b>wheel</b> zoom to cursor<br>
+      <b>touch</b> drag orbit · pinch zoom · two-finger pan · tap pin<br>
       <b>ctrl-drag</b> a slice to move along axis<br>
       <b>[ ]</b> date · <b>( )</b> ticker · <b>{ }</b> feature (hold ctrl ×10)<br>
       <b>r</b> reset view
